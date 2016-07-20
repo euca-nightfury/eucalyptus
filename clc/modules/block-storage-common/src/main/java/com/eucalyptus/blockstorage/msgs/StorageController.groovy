@@ -162,6 +162,19 @@ public class GetVolumeTokenResponseType extends StorageResponseType {
   String token;
 }
 
+public class RevokeVolumeTokenType extends StorageRequestType {
+  String volumeId;
+
+  def RevokeVolumeTokenType() {}
+
+  def RevokeVolumeTokenType(String vol) {
+    this.volumeId = vol;
+  }
+}
+
+public class RevokeVolumeTokenResponseType extends StorageResponseType {
+}
+
 public class UpdateStorageConfigurationType extends StorageRequestType {
   String name;
   ArrayList<ComponentProperty> storageParams;

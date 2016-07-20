@@ -103,6 +103,7 @@ import com.eucalyptus.auth.Accounts;
 import com.eucalyptus.auth.principal.UserFullName;
 import com.eucalyptus.blockstorage.msgs.GetVolumeTokenResponseType;
 import com.eucalyptus.blockstorage.msgs.GetVolumeTokenType;
+import com.eucalyptus.blockstorage.msgs.RevokeVolumeTokenType;
 import com.eucalyptus.blockstorage.util.StorageProperties;
 import com.eucalyptus.cloud.ResourceToken;
 import com.eucalyptus.cloud.run.AdmissionControl;
@@ -956,13 +957,19 @@ public class VmInstances extends com.eucalyptus.compute.common.internal.vm.VmIns
   private static void cleanUpAttachedVolumes( final String instanceId,
                                               final String qualifier,
                                               final Collection<? extends VmVolumeAttachment> attachments,
-                                              final Predicate<? super VmVolumeAttachment> matching ) {
+                                              final Predicate<? super VmVolumeAttachment> matching, 
+                                              final ServiceConfiguration scConfig) {
     if ( attachments != null ) {
       for ( final VmVolumeAttachment attachment : Iterables.filter( Lists.newArrayList( attachments ), matching ) ) {
         try {
           LOG.debug( instanceId + ": Marking " + qualifier + " volume EXTANT " + attachment.getVolumeId( ) );
           final Volume volume = Volumes.lookup( null, attachment.getVolumeId( ) );
           if ( State.BUSY.equals( volume.getState( ) ) ) {
+            try {
+              AsyncRequests.sendSync(scConfig, new RevokeVolumeTokenType(attachment.getVolumeId()));
+            } catch (final Throwable t) {
+              LOG.warn("Failed to revoke token for volume " + attachment.getVolumeId(), t);
+            }
             volume.setState( State.EXTANT );
           }
           attachments.remove( attachment );
@@ -991,15 +998,17 @@ public class VmInstances extends com.eucalyptus.compute.common.internal.vm.VmIns
       try ( final TransactionResource db = Entities.distinctTransactionFor( VmInstance.class ) ) {
         final VmInstance instance = Entities.merge( vm );
 
+        ServiceConfiguration scConfig = Topology.lookup(Storage.class, vm.lookupPartition());
+
         // Clean up transient volumes
         if ( instance.getTransientVolumeState( ) != null ) {
-          cleanUpAttachedVolumes( instance.getInstanceId( ), "transient", instance.getTransientVolumeState( ).getAttachments( ), deleteOnTerminateFilter( false ) );
+          cleanUpAttachedVolumes( instance.getInstanceId( ), "transient", instance.getTransientVolumeState( ).getAttachments( ), deleteOnTerminateFilter( false ), scConfig );
           addMatchingVolumeIds( volumesToDelete, instance.getTransientVolumeState().getAttachments(), deleteOnTerminateFilter( true ) );
         }
 
         // Clean up persistent volumes that are not delete-on-terminate
         if ( instance.getBootRecord() != null ) {
-          cleanUpAttachedVolumes( instance.getInstanceId( ), "persistent", instance.getBootRecord( ).getPersistentVolumes( ), deleteOnTerminateFilter( false ) );
+          cleanUpAttachedVolumes( instance.getInstanceId( ), "persistent", instance.getBootRecord( ).getPersistentVolumes( ), deleteOnTerminateFilter( false ), scConfig );
           addMatchingVolumeIds( volumesToDelete, instance.getBootRecord( ).getPersistentVolumes( ), deleteOnTerminateFilter( true ) );
         }
 
@@ -1620,6 +1629,12 @@ public class VmInstances extends com.eucalyptus.compute.common.internal.vm.VmIns
         }
       }
       if ( State.BUSY.equals( volEntity.getState( ) ) ) {
+        try {
+          ServiceConfiguration scConfig = Topology.lookup(Storage.class, vm.lookupPartition());
+          AsyncRequests.sendSync(scConfig, new RevokeVolumeTokenType(volumeId));
+        } catch (final Throwable t) {
+          LOG.warn("Failed to revoke token for volume " + volumeId, t);
+        }
         volEntity.setState( State.EXTANT );
       }
       db.commit( );

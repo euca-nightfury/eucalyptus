@@ -69,7 +69,6 @@ import java.util.List;
 import java.util.NoSuchElementException;
 
 import org.apache.log4j.Logger;
-import com.eucalyptus.org.apache.tools.ant.util.DateUtils;
 import org.hibernate.Criteria;
 import org.hibernate.criterion.Restrictions;
 
@@ -122,6 +121,8 @@ import com.eucalyptus.blockstorage.msgs.GetStorageVolumeResponseType;
 import com.eucalyptus.blockstorage.msgs.GetStorageVolumeType;
 import com.eucalyptus.blockstorage.msgs.GetVolumeTokenResponseType;
 import com.eucalyptus.blockstorage.msgs.GetVolumeTokenType;
+import com.eucalyptus.blockstorage.msgs.RevokeVolumeTokenResponseType;
+import com.eucalyptus.blockstorage.msgs.RevokeVolumeTokenType;
 import com.eucalyptus.blockstorage.msgs.StorageSnapshot;
 import com.eucalyptus.blockstorage.msgs.StorageVolume;
 import com.eucalyptus.blockstorage.msgs.UnexportVolumeResponseType;
@@ -142,6 +143,7 @@ import com.eucalyptus.context.NoSuchContextException;
 import com.eucalyptus.entities.Entities;
 import com.eucalyptus.entities.TransactionException;
 import com.eucalyptus.entities.TransactionResource;
+import com.eucalyptus.org.apache.tools.ant.util.DateUtils;
 import com.eucalyptus.storage.common.CheckerTask;
 import com.eucalyptus.util.EucalyptusCloudException;
 import com.eucalyptus.util.metrics.MonitoredAction;
@@ -163,6 +165,20 @@ public class BlockStorageController {
   private static Logger LOG = Logger.getLogger(BlockStorageController.class);
 
   static LogicalStorageManager blockManager;
+
+  private static final Predicate<VolumeToken> INVALIDATE_ALL = new Predicate<VolumeToken>() {
+    @Override
+    public boolean apply(VolumeToken volToken) {
+      VolumeToken tokenEntity = Entities.merge(volToken);
+      try {
+        tokenEntity.invalidateAllExportsAndToken();
+        return true;
+      } catch (Exception e) {
+        LOG.error("Failed invalidating exports for token " + tokenEntity.getToken());
+        return false;
+      }
+    }
+  };
 
   // TODO: zhill, this can be added later for snapshot abort capabilities
   // static ConcurrentHashMap<String,HttpTransfer> httpTransferMap; //To keep track of current transfers to support aborting
@@ -395,6 +411,52 @@ public class BlockStorageController {
       LOG.error("Failed to get volume token: " + e.getMessage());
       throw new EucalyptusCloudException("Could not get volume token for volume " + request.getVolumeId(), e);
     }
+  }
+
+  public RevokeVolumeTokenResponseType RevokeVolumeToken(RevokeVolumeTokenType request) throws EucalyptusCloudException {
+    RevokeVolumeTokenResponseType reply = (RevokeVolumeTokenResponseType) request.getReply();
+    String volumeId = request.getVolumeId();
+    LOG.info("Processing RevokeVolumeToken request for volume " + volumeId);
+
+    try (TransactionResource tran = Entities.transactionFor(VolumeInfo.class)) {
+      VolumeInfo vol = Entities.uniqueResult(new VolumeInfo(volumeId));
+      LOG.debug("Checking export status for volume " + volumeId);
+      if (Iterables.any(vol.getAttachmentTokens(), new Predicate<VolumeToken>() {
+        @Override
+        public boolean apply(VolumeToken token) {
+          // Return true if attachment is valid or export exists.
+          try {
+            return token.hasActiveExports();
+          } catch (EucalyptusCloudException e) {
+            LOG.warn("Failure checking for active exports for volume " + volumeId);
+            return false;
+          }
+        }
+      })) {
+        // Exports exists... try un exporting the volume before revoking token.
+        LOG.info("Volume " + volumeId + " found to be exported. Detaching volume from all hosts before invalidating exports and revoking token");
+        try {
+          Entities.asTransaction(VolumeInfo.class, invalidateAndDetachAll()).apply(volumeId);
+        } catch (Exception e) {
+          LOG.error("Failed to fully detach volume " + volumeId, e);
+        }
+      } else {
+        // No active exports exists... revoke token.
+        LOG.info("No active exports found for volume " + volumeId + " found to be exported. Revoking token");
+        try {
+          Entities.asTransaction(VolumeInfo.class, invalidateAllExportsAndToken()).apply(volumeId);
+        } catch (Exception e) {
+          LOG.error("Failed to fully detach volume " + volumeId, e);
+        }
+      }
+    } catch (NoSuchElementException e) {
+      LOG.warn("Volume " + volumeId + " not found in DB", e);
+      throw new EucalyptusCloudException("Volume " + volumeId + " not found");
+    } catch (Exception e) {
+      LOG.warn("Failed RevokeVolumeToken due to: " + e.getMessage(), e);
+      throw new EucalyptusCloudException(e);
+    }
+    return reply;
   }
 
   /**
@@ -1186,20 +1248,6 @@ public class BlockStorageController {
 
   private static Function<String, VolumeInfo> invalidateAndDetachAll() {
 
-    final Predicate<VolumeToken> invalidateExports = new Predicate<VolumeToken>() {
-      @Override
-      public boolean apply(VolumeToken volToken) {
-        VolumeToken tokenEntity = Entities.merge(volToken);
-        try {
-          tokenEntity.invalidateAllExportsAndToken();
-          return true;
-        } catch (Exception e) {
-          LOG.error("Failed invalidating exports for token " + tokenEntity.getToken());
-          return false;
-        }
-      }
-    };
-
     // Could save cycles by statically setting all of these functions that don't require closures so they are not
     // constructed for each request.
     return new Function<String, VolumeInfo>() {
@@ -1210,7 +1258,7 @@ public class BlockStorageController {
           try {
             LOG.debug("Invalidating all tokens and all exports for " + volumeId);
             // Invalidate all tokens and exports and forcibly detach.
-            if (!Iterables.all(volumeEntity.getAttachmentTokens(), invalidateExports)) {
+            if (!Iterables.all(volumeEntity.getAttachmentTokens(), INVALIDATE_ALL)) {
               // At least one failed.
               LOG.error("Failed to invalidate all tokens and exports");
             }
@@ -1223,6 +1271,37 @@ public class BlockStorageController {
             blockManager.unexportVolumeFromAll(volumeId);
           } catch (EucalyptusCloudException ex) {
             LOG.error("Detaching volume " + volumeId + " from all hosts failed", ex);
+          }
+        } catch (NoSuchElementException e) {
+          LOG.error("Cannot force detach of volume " + volumeId + " because it is not found in database");
+          return null;
+        } catch (TransactionException e) {
+          LOG.error("Failed to lookup volume " + volumeId);
+        }
+
+        return null;
+      }
+    };
+  }
+
+  private static Function<String, VolumeInfo> invalidateAllExportsAndToken() {
+
+    // Could save cycles by statically setting all of these functions that don't require closures so they are not
+    // constructed for each request.
+    return new Function<String, VolumeInfo>() {
+      @Override
+      public VolumeInfo apply(String volumeId) {
+        try {
+          VolumeInfo volumeEntity = Entities.uniqueResult(new VolumeInfo(volumeId));
+          try {
+            LOG.debug("Invalidating all tokens and all exports for " + volumeId);
+            // Invalidate all tokens and exports and forcibly detach.
+            if (!Iterables.all(volumeEntity.getAttachmentTokens(), INVALIDATE_ALL)) {
+              // At least one failed.
+              LOG.error("Failed to invalidate all tokens and exports");
+            }
+          } catch (Exception e) {
+            LOG.error("Error invalidating tokens", e);
           }
         } catch (NoSuchElementException e) {
           LOG.error("Cannot force detach of volume " + volumeId + " because it is not found in database");
